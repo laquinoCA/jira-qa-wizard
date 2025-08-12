@@ -24,11 +24,54 @@ The tool automatically:
 
 ## 📋 Prerequisites
 
-- Python 3.7+
+- **Python 3.10+** (required for union type syntax)
 - Jira API access with appropriate permissions
 - GitHub API access (personal access token)
 - Claude API access (Anthropic API key)
 - Access to ConsumerAffairs Jira instance
+
+### Python Setup (macOS)
+
+Check your Python version:
+```bash
+python3 --version
+```
+
+**If you don't have Python installed:**
+```bash
+# Install Homebrew first (if not already installed)
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Then install Python
+brew install python
+```
+
+**Or download from official site:**
+- Download Python 3.10+ from [python.org](https://www.python.org/downloads/macos/)
+- Run the installer
+
+**If you have Python < 3.10, update it:**
+```bash
+# Using Homebrew
+brew install python@3.10
+
+# Using pyenv
+pyenv install 3.10.12
+pyenv global 3.10.12
+```
+
+## 📦 Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/laquinoCA/jira-qa-wizard.git
+cd jira-qa-wizard
+```
+
+2. Install the required dependencies:
+```bash
+pip install -r requirements.txt
+```
 
 ## ⚙️ Configuration
 

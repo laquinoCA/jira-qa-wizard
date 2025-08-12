@@ -532,6 +532,7 @@ QA Environment Requirements:
 - Use Django admin interface to check data if possible
 - Use Django shell if indicated in the PR description or code changes
 - Access APIs through proper authentication and endpoints
+- We don't have to run the migrations in the QA environment, it will be automatically done by the application
 
 QA Environment Base URLs (use these in test cases):
 - STYLEGUIDE_URL = "https://qa-styleguide.consumeraffairs.com"
