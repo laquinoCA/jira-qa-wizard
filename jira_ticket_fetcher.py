@@ -6,8 +6,9 @@ Jira Ticket Fetcher - Fetches ticket descriptions and acceptance criteria using 
 import os
 import requests
 import json
+import re
 from base64 import b64encode
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import anthropic
 
 # Load environment variables from .env file
@@ -439,7 +440,7 @@ class JiraTicketFetcher:
         
         return '\n'.join(formatted_lines)
     
-    def generate_test_cases(self, ticket_data: Dict[str, Any], pr_context: str = "", parent_context: str = "") -> tuple[str | None, str]:
+    def generate_test_cases(self, ticket_data: Dict[str, Any], pr_context: str = "", parent_context: str = "", confluence_context: str = "") -> tuple[str | None, str]:
         """Generate test cases using Claude AI based on ticket data"""
         issue_key = ticket_data.get('key', 'Unknown')
         summary = ticket_data.get('summary', 'No summary')
@@ -466,6 +467,10 @@ ACCEPTANCE CRITERIA:
             context += parent_context
             print(f"📋 Including parent ticket context ({len(parent_context)} characters)")
         
+        if confluence_context:
+            context += confluence_context
+            print(f"📋 Including project documentation context ({len(confluence_context)} characters)")
+        
         # Store the context that will be used for test case generation
         generation_context = context
         
@@ -475,11 +480,12 @@ Be comprehensive and precise. Output only the test cases in the specified format
 
 IMPORTANT: Generate test cases ONLY for the main ticket described in the TICKET, SUMMARY, DESCRIPTION, and ACCEPTANCE CRITERIA sections. 
 
-The PARENT TICKET CONTEXT and CHILD ISSUES CONTEXT sections are provided for broader project understanding and context awareness, but should NOT be the primary focus of your test cases. Use this context to:
+The PARENT TICKET CONTEXT, CHILD ISSUES CONTEXT, and PROJECT DOCUMENTATION CONTEXT sections are provided for broader project understanding and context awareness, but should NOT be the primary focus of your test cases. Use this context to:
 - Better understand the bigger picture and business goals
 - Ensure test cases align with the overall project direction
 - Include relevant integration points where they relate to the main ticket
 - Avoid conflicts with parallel work streams
+- Understand the broader project architecture and requirements
 
 PRIMARY TEST FOCUS: Generate test cases specifically for the main ticket's functionality, implementation, and acceptance criteria.
 
@@ -808,6 +814,17 @@ Generate comprehensive, QA environment-appropriate test cases now:"""
         if not tickets:
             return []
         
+        # Fetch all mentioned Confluence documentation for broader project context
+        fetch_confluence = os.getenv('FETCH_CONFLUENCE', 'false').lower() == 'true'
+        confluence_docs = {}
+        confluence_mentions = {}
+        
+        if fetch_confluence:
+            confluence_docs = self.fetch_all_mentioned_documentation(tickets)
+            confluence_mentions = self.find_confluence_mentions_for_tickets(tickets)
+        else:
+            print("ℹ️  Confluence fetching disabled (FETCH_CONFLUENCE=false)")
+        
         test_cases_field_id = os.getenv('TEST_CASES_FIELD', 'customfield_11600')
         
         for ticket in tickets:
@@ -884,7 +901,56 @@ Generate comprehensive, QA environment-appropriate test cases now:"""
                             ac = issue['acceptance_criteria'][:200] + "..." if len(issue['acceptance_criteria']) > 200 else issue['acceptance_criteria']
                             parent_context += f"\nAcceptance Criteria: {ac}"
             
-            test_cases, generation_context = self.generate_test_cases(ticket, pr_context=pr_context, parent_context=parent_context)
+            # Build Confluence documentation context
+            confluence_context = ""
+            if confluence_docs:
+                confluence_context = "\n\nPROJECT DOCUMENTATION CONTEXT:"
+                for page_id, doc in confluence_docs.items():
+                    confluence_context += f"\n\n--- {doc['title']} ---"
+                    confluence_context += f"\nURL: {doc['url']}"
+                    if doc.get('body'):
+                        # Limit each document to reasonable length
+                        body = doc['body'][:2000] + "..." if len(doc['body']) > 2000 else doc['body']
+                        confluence_context += f"\nContent:\n{body}"
+            
+            # Build Confluence mentions context - include ALL related tickets (main, parent, siblings)
+            if confluence_mentions:
+                mention_context = ""
+                
+                # Get all relevant keys: main ticket, parent, and all sibling issues
+                relevant_keys = [ticket['key']]  # Main ticket
+                if 'parent_ticket' in ticket:
+                    relevant_keys.append(ticket['parent_ticket']['key'])  # Parent ticket
+                    
+                    # Add all sibling issues (child issues of the parent)
+                    if 'related_issues' in ticket['parent_ticket']:
+                        for related in ticket['parent_ticket']['related_issues']:
+                            sibling_key = related.get('key')
+                            if sibling_key and sibling_key not in relevant_keys:
+                                relevant_keys.append(sibling_key)
+                
+                # Process mentions for all relevant keys
+                found_mentions = {}
+                for key in relevant_keys:
+                    if key in confluence_mentions:
+                        found_mentions[key] = confluence_mentions[key]
+                
+                if found_mentions:
+                    mention_context = "\n\nCONFLUENCE MENTIONS CONTEXT:"
+                    
+                    for key, mentions in found_mentions.items():
+                        mention_context += f"\n\n--- Pages mentioning {key} ---"
+                        for mention in mentions:
+                            mention_context += f"\n• {mention['title']} ({mention['space_name']})"
+                            mention_context += f"\n  URL: {mention['url']}"
+                            if mention.get('body'):
+                                # Include relevant excerpt
+                                body_excerpt = mention['body'][:800] + "..." if len(mention['body']) > 800 else mention['body']
+                                mention_context += f"\n  Content: {body_excerpt}"
+                
+                confluence_context += mention_context
+            
+            test_cases, generation_context = self.generate_test_cases(ticket, pr_context=pr_context, parent_context=parent_context, confluence_context=confluence_context)
             
             if test_cases:
                 print(f"📝 Generated test cases for {ticket['key']}")
@@ -903,6 +969,33 @@ Generate comprehensive, QA environment-appropriate test cases now:"""
             else:
                 print(f"❌ Failed to generate test cases for {ticket['key']}")
                 ticket['test_cases_updated'] = False
+            
+            # Add Confluence documentation to the ticket data
+            if confluence_docs:
+                ticket['mentioned_documentation'] = confluence_docs
+            
+            # Add Confluence mentions to the ticket data - include ALL related tickets
+            if confluence_mentions:
+                # Filter mentions for all related tickets (main, parent, siblings)
+                ticket_mentions = {}
+                relevant_keys = [ticket['key']]  # Main ticket
+                if 'parent_ticket' in ticket:
+                    relevant_keys.append(ticket['parent_ticket']['key'])  # Parent ticket
+                    
+                    # Add all sibling issues
+                    if 'related_issues' in ticket['parent_ticket']:
+                        for related in ticket['parent_ticket']['related_issues']:
+                            sibling_key = related.get('key')
+                            if sibling_key and sibling_key not in relevant_keys:
+                                relevant_keys.append(sibling_key)
+                
+                # Collect mentions for all relevant keys
+                for key in relevant_keys:
+                    if key in confluence_mentions:
+                        ticket_mentions[key] = confluence_mentions[key]
+                
+                if ticket_mentions:
+                    ticket['confluence_mentions'] = ticket_mentions
         
         return tickets
     
@@ -936,7 +1029,7 @@ Generate comprehensive, QA environment-appropriate test cases now:"""
                 issue_data = response.json()
                 fields_data = issue_data.get('fields', {})
                 
-                # Extract description from custom field or standard field
+                # Extract description from custom field
                 description_content = fields_data.get(description_field_id)
                 description = self._extract_text_content(description_content)
                 
@@ -1370,6 +1463,505 @@ DETAILED FILE CHANGES:
                     break
         
         return context
+
+    def extract_mentioned_on_links(self, content: str) -> List[str]:
+        """Extract Confluence page URLs from 'mentioned on' sections in Jira content"""
+        if not content:
+            return []
+        
+        # Pattern to match Confluence URLs in various formats
+        confluence_patterns = [
+            # Direct Confluence URLs
+            r'https://[^/]+\.atlassian\.net/wiki/spaces/[^/]+/pages/[^/\s]+/[^\s<>"]+',
+            # URLs in href attributes
+            r'href="(https://[^/]+\.atlassian\.net/wiki/spaces/[^/]+/pages/[^/\s"]+/[^"\s]+)"',
+            # URLs in markdown links
+            r'\[.*?\]\((https://[^/]+\.atlassian\.net/wiki/spaces/[^/]+/pages/[^/\s)]+/[^)\s]+)\)',
+        ]
+        
+        mentioned_links = []
+        for pattern in confluence_patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            if isinstance(matches[0] if matches else None, tuple):
+                # For patterns with groups, extract the URL group
+                mentioned_links.extend([match[0] if isinstance(match, tuple) else match for match in matches])
+            else:
+                mentioned_links.extend(matches)
+        
+        # Remove duplicates and decode URL-encoded characters
+        unique_links = []
+        for link in mentioned_links:
+            decoded_link = requests.utils.unquote(link)
+            if decoded_link not in unique_links:
+                unique_links.append(decoded_link)
+        
+        return unique_links
+
+    def get_confluence_page_id_from_url(self, url: str) -> Optional[str]:
+        """Extract page ID from Confluence URL"""
+        # Pattern: /pages/{pageId}/PageTitle
+        page_id_match = re.search(r'/pages/(\d+)/', url)
+        if page_id_match:
+            return page_id_match.group(1)
+        return None
+
+    def fetch_confluence_content(self, page_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch Confluence page content using REST API v2"""
+        try:
+            # Get base Confluence URL from Jira URL
+            confluence_base = self.jira_url.replace('//consumeraffairs.atlassian.net', '//consumeraffairs.atlassian.net')
+            
+            url = f"{confluence_base}/wiki/api/v2/pages/{page_id}"
+            headers = {
+                "Authorization": self.auth_header,
+                "Accept": "application/json"
+            }
+            
+            # Add body format parameter to get the content
+            params = {"body-format": "atlas_doc_format"}
+            
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                page_data = response.json()
+                
+                # Extract meaningful content
+                content_info = {
+                    "id": page_data.get("id"),
+                    "title": page_data.get("title", ""),
+                    "body": "",
+                    "url": f"{confluence_base}/wiki/spaces/{page_data.get('spaceId', '')}/pages/{page_id}"
+                }
+                
+                # Extract body content if available
+                if "body" in page_data and "atlas_doc_format" in page_data["body"]:
+                    body_content = page_data["body"]["atlas_doc_format"].get("value", "")
+                    # Convert ADF to readable text
+                    content_info["body"] = self._extract_confluence_text(body_content)
+                
+                return content_info
+            else:
+                print(f"❌ Failed to fetch Confluence page {page_id}: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error fetching Confluence page {page_id}: {str(e)}")
+            return None
+
+    def _extract_confluence_text(self, adf_content: str) -> str:
+        """Extract readable text from Confluence ADF content"""
+        try:
+            if isinstance(adf_content, str):
+                adf_data = json.loads(adf_content)
+            else:
+                adf_data = adf_content
+            
+            # Use existing ADF text extraction method
+            return self._extract_adf_text(adf_data)
+        except:
+            # If JSON parsing fails, return as-is
+            return str(adf_content) if adf_content else ""
+
+    def fetch_all_mentioned_documentation(self, tickets: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        """Fetch all Confluence documentation mentioned across all tickets"""
+        print("🔗 Fetching mentioned documentation...")
+        
+        all_confluence_content = {}
+        processed_pages = set()  # Avoid fetching the same page multiple times
+        
+        for ticket in tickets:
+            # Check main ticket content (both custom and standard description fields)
+            ticket_content = f"{ticket.get('description', '')} {ticket.get('summary', '')}"
+            
+            # Check parent ticket if exists
+            if 'parent_ticket' in ticket:
+                parent = ticket['parent_ticket']
+                # Check parent ticket content
+                parent_desc = parent.get('description', '')
+                ticket_content += f" {parent_desc} {parent.get('summary', '')}"
+                
+                # Check related issues
+                if 'related_issues' in parent:
+                    for related in parent['related_issues']:
+                        ticket_content += f" {related.get('description', '')} {related.get('summary', '')}"
+            
+            # Extract Confluence links
+            mentioned_links = self.extract_mentioned_on_links(ticket_content)
+            
+            for link in mentioned_links:
+                page_id = self.get_confluence_page_id_from_url(link)
+                if page_id and page_id not in processed_pages:
+                    print(f"   📄 Fetching Confluence page: {page_id}")
+                    content = self.fetch_confluence_content(page_id)
+                    if content:
+                        all_confluence_content[page_id] = content
+                        processed_pages.add(page_id)
+        
+        if all_confluence_content:
+            print(f"   ✅ Fetched {len(all_confluence_content)} Confluence document(s)")
+        else:
+            print("   ℹ️  No Confluence documents found in mentioned links")
+        
+        return all_confluence_content
+
+    def fetch_confluence_page_storage(self, page_id: str) -> Optional[str]:
+        """Fetch Confluence page storage format to analyze Jira macros"""
+        try:
+            confluence_base = self.jira_url.replace('//consumeraffairs.atlassian.net', '//consumeraffairs.atlassian.net')
+            
+            # Use the storage format endpoint to get raw content with Jira macros
+            url = f"{confluence_base}/wiki/rest/api/content/{page_id}?expand=body.storage"
+            headers = {
+                "Authorization": self.auth_header,
+                "Accept": "application/json"
+            }
+            
+            response = requests.get(url, headers=headers)
+            
+            if response.status_code == 200:
+                page_data = response.json()
+                storage_body = page_data.get("body", {}).get("storage", {}).get("value", "")
+                return storage_body
+            else:
+                print(f"   ❌ Failed to fetch storage for page {page_id}: {response.status_code}")
+                return None
+                
+        except Exception as e:
+            print(f"   ❌ Error fetching storage for page {page_id}: {str(e)}")
+            return None
+
+    def extract_jira_tickets_from_storage(self, storage_content: str) -> List[str]:
+        """Extract Jira ticket keys from Confluence storage format"""
+        if not storage_content:
+            return []
+        
+        ticket_keys = []
+        
+        # Pattern 1: Jira structured macros - <ac:structured-macro ac:name="jira"
+        jira_macro_pattern = r'<ac:structured-macro ac:name="jira"[^>]*>.*?</ac:structured-macro>'
+        jira_macros = re.findall(jira_macro_pattern, storage_content, re.DOTALL)
+        
+        for macro in jira_macros:
+            # Extract ticket key from macro parameters
+            # Look for patterns like <ac:parameter ac:name="key">PDW-8744</ac:parameter>
+            key_pattern = r'<ac:parameter ac:name="key">([^<]+)</ac:parameter>'
+            keys = re.findall(key_pattern, macro)
+            ticket_keys.extend(keys)
+        
+        # Pattern 2: Smart links with Jira URLs
+        smart_link_pattern = r'data-card-url="https://[^"]*\.atlassian\.net/browse/([^"]+)"'
+        smart_link_keys = re.findall(smart_link_pattern, storage_content)
+        ticket_keys.extend(smart_link_keys)
+        
+        # Pattern 3: Direct href links to Jira
+        href_pattern = r'href="https://[^"]*\.atlassian\.net/browse/([^"]+)"'
+        href_keys = re.findall(href_pattern, storage_content)
+        ticket_keys.extend(href_keys)
+        
+        # Pattern 4: Plain text ticket references (PDW-XXXX format)
+        plain_text_pattern = r'\b(PDW-\d+)\b'
+        plain_keys = re.findall(plain_text_pattern, storage_content)
+        ticket_keys.extend(plain_keys)
+        
+        # Remove duplicates and return
+        return list(set(ticket_keys))
+
+    def search_known_confluence_pages_for_tickets(self, ticket_keys: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Search known Confluence pages by examining their storage format"""
+        print("🔍 Searching known Confluence pages via storage format...")
+        
+        mentions_found = {}
+        
+        # Get a list of pages that might contain project documentation
+        # We'll search for pages with project-related terms first
+        project_search_terms = [
+            "Project Plan", "Email Campaign", "Aspect", "Development", 
+            "Epic", "Feature", "Implementation"
+        ]
+        
+        confluence_base = self.jira_url.replace('//consumeraffairs.atlassian.net', '//consumeraffairs.atlassian.net')
+        search_url = f"{confluence_base}/wiki/rest/api/search"
+        headers = {
+            "Authorization": self.auth_header,
+            "Accept": "application/json"
+        }
+        
+        # Find potentially relevant pages
+        candidate_pages = []
+        for search_term in project_search_terms:
+            search_params = {
+                "cql": f'title ~ "{search_term}" AND type = page',
+                "limit": 10,
+                "expand": "content.space,content.version"
+            }
+            
+            response = requests.get(search_url, headers=headers, params=search_params)
+            
+            if response.status_code == 200:
+                results = response.json().get("results", [])
+                for result in results:
+                    content = result.get("content", {})
+                    page_id = content.get("id")
+                    if page_id:
+                        candidate_pages.append({
+                            "id": page_id,
+                            "title": content.get("title", ""),
+                            "space_name": content.get("space", {}).get("name", ""),
+                            "space_key": content.get("space", {}).get("key", "")
+                        })
+        
+        # Remove duplicates
+        seen_pages = set()
+        unique_pages = []
+        for page in candidate_pages:
+            if page["id"] not in seen_pages:
+                unique_pages.append(page)
+                seen_pages.add(page["id"])
+        
+        print(f"   📄 Analyzing {len(unique_pages)} candidate pages for Jira references...")
+        
+        # Analyze each candidate page
+        for page in unique_pages:
+            storage_content = self.fetch_confluence_page_storage(page["id"])
+            if storage_content:
+                found_tickets = self.extract_jira_tickets_from_storage(storage_content)
+                
+                # Check if any of our target tickets are mentioned
+                relevant_tickets = [ticket for ticket in found_tickets if ticket in ticket_keys]
+                
+                if relevant_tickets:
+                    print(f"   ✅ Found tickets {relevant_tickets} in '{page['title']}'")
+                    
+                    for ticket_key in relevant_tickets:
+                        if ticket_key not in mentions_found:
+                            mentions_found[ticket_key] = []
+                        
+                        mention_info = {
+                            "id": page["id"],
+                            "title": page["title"],
+                            "type": "page",
+                            "space_key": page["space_key"],
+                            "space_name": page["space_name"],
+                            "url": f"{confluence_base}/wiki/spaces/{page['space_key']}/pages/{page['id']}",
+                            "excerpt": f"Found via storage format analysis in {page['title']}",
+                            "lastModified": "",
+                            "body": storage_content[:1500] + "..." if len(storage_content) > 1500 else storage_content
+                        }
+                        
+                        mentions_found[ticket_key].append(mention_info)
+        
+        return mentions_found
+
+    def search_confluence_for_ticket_mentions(self, ticket_keys: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+        """Search Confluence for mentions of ticket keys using search API"""
+        print(f"🔍 Searching Confluence for mentions of tickets: {', '.join(ticket_keys)}")
+        
+        confluence_base = self.jira_url.replace('//consumeraffairs.atlassian.net', '//consumeraffairs.atlassian.net')
+        mentions_found = {}
+        
+        for ticket_key in ticket_keys:
+            try:
+                # Use Confluence search API to find pages mentioning the ticket key
+                search_url = f"{confluence_base}/wiki/api/v2/pages"
+                headers = {
+                    "Authorization": self.auth_header,
+                    "Accept": "application/json"
+                }
+                
+                # Search for pages containing the ticket key
+                params = {
+                    "body-format": "atlas_doc_format",
+                    "limit": 10  # Limit to avoid too many results
+                }
+                
+                # Use the search endpoint with CQL (Confluence Query Language)
+                search_url = f"{confluence_base}/wiki/rest/api/search"
+                
+                # Use precise CQL queries to avoid false positives
+                cql_queries = [
+                    f'text ~ "{ticket_key}" AND type = page',  # Full ticket key (PDW-8744)
+                    f'title ~ "{ticket_key}" AND type = page',  # Search in titles
+                    f'text ~ "browse/{ticket_key}" AND type = page',  # URL pattern in smart links
+                    f'text ~ "atlassian.net/browse/{ticket_key}" AND type = page',  # Full URL pattern
+                    f'text ~ "{ticket_key}:" AND type = page',  # Title pattern (PDW-8744: Title)
+                ]
+                
+                # Only search for ticket numbers if they're part of a clear ticket pattern
+                # This avoids false positives like addresses or random numbers
+                if ticket_key.startswith('PDW-'):
+                    ticket_number = ticket_key.replace('PDW-', '')
+                    # Only add number search if it's a reasonable length to avoid false positives
+                    if len(ticket_number) >= 4:  # Only search for 4+ digit numbers to avoid false matches
+                        cql_queries.extend([
+                            f'text ~ "PDW-{ticket_number}" AND type = page',  # Ensure PDW- prefix
+                            f'text ~ "browse/PDW-{ticket_number}" AND type = page',  # URL with PDW prefix
+                        ])
+                
+                # Try each CQL query and combine results
+                all_results = []
+                found_page_ids = set()  # Track to avoid duplicates
+                successful_queries = []  # Track which queries worked
+                
+                for i, cql_query in enumerate(cql_queries):
+                    search_params = {
+                        "cql": cql_query,
+                        "limit": 15,
+                        "expand": "content.space,content.version,content.body.view"
+                    }
+                    
+                    response = requests.get(search_url, headers=headers, params=search_params)
+                    
+                    if response.status_code == 200:
+                        search_results = response.json()
+                        results = search_results.get("results", [])
+                        
+                        # Add unique results
+                        new_results_count = 0
+                        for result in results:
+                            page_id = result.get("content", {}).get("id")
+                            if page_id and page_id not in found_page_ids:
+                                all_results.append(result)
+                                found_page_ids.add(page_id)
+                                new_results_count += 1
+                        
+                        if new_results_count > 0:
+                            successful_queries.append(f"Query {i+1}: '{cql_query}' -> {new_results_count} results")
+                    else:
+                        continue  # Try next query if this one fails
+                
+                # Print debug info for successful searches
+                if successful_queries:
+                    print(f"   🔍 Search details for {ticket_key}:")
+                    for query_info in successful_queries:
+                        print(f"      {query_info}")
+                
+                # Process results if we found any
+                ticket_mentions = []
+                if all_results:
+                    for result in all_results:
+                        content = result.get("content", {})
+                        if content:
+                            mention_info = {
+                                "id": content.get("id"),
+                                "title": content.get("title", ""),
+                                "type": content.get("type", ""),
+                                "space_key": content.get("space", {}).get("key", ""),
+                                "space_name": content.get("space", {}).get("name", ""),
+                                "url": f"{confluence_base}/wiki{content.get('_links', {}).get('webui', '')}" if content.get('_links', {}).get('webui') else "",
+                                "excerpt": result.get("excerpt", ""),
+                                "lastModified": content.get("version", {}).get("when", "")
+                            }
+                            
+                            # Try to get the page content for more context and validation
+                            if mention_info["id"]:
+                                page_content = self.fetch_confluence_content(mention_info["id"])
+                                if page_content:
+                                    full_body = page_content["body"]
+                                    
+                                    # Validate this is a real ticket mention, not a false positive
+                                    if self._is_valid_ticket_mention(ticket_key, full_body, mention_info["title"]):
+                                        mention_info["body"] = full_body[:1500] + "..." if len(full_body) > 1500 else full_body
+                                        ticket_mentions.append(mention_info)
+                                    else:
+                                        continue  # Skip false positives
+                                else:
+                                    # If we can't get content, still check title and excerpt
+                                    excerpt = result.get("excerpt", "")
+                                    if self._is_valid_ticket_mention(ticket_key, excerpt, mention_info["title"]):
+                                        ticket_mentions.append(mention_info)
+                            else:
+                                # If no page ID, still check excerpt
+                                excerpt = result.get("excerpt", "")
+                                if self._is_valid_ticket_mention(ticket_key, excerpt, mention_info["title"]):
+                                    ticket_mentions.append(mention_info)
+
+                # Also search using storage format analysis to find smart links and Jira macros
+                print(f"   🔍 Also searching with storage format analysis for {ticket_key}...")
+                storage_results = self.search_known_confluence_pages_for_tickets([ticket_key])
+                if storage_results.get(ticket_key):
+                    print(f"   ✅ Storage format analysis found {len(storage_results[ticket_key])} additional mentions")
+                    
+                    # Merge storage results with existing mentions, avoiding duplicates
+                    existing_page_ids = {mention.get("id") for mention in ticket_mentions if mention.get("id")}
+                    for storage_mention in storage_results[ticket_key]:
+                        if storage_mention.get("id") not in existing_page_ids:
+                            ticket_mentions.append(storage_mention)
+                
+                if ticket_mentions:
+                    mentions_found[ticket_key] = ticket_mentions
+                    print(f"   ✅ Found {len(ticket_mentions)} Confluence page(s) mentioning {ticket_key} (including storage format analysis)")
+                else:
+                    print(f"   ℹ️  No Confluence mentions found for {ticket_key}")
+                    
+            except Exception as e:
+                print(f"   ❌ Exception searching for {ticket_key}: {str(e)}")
+        
+        return mentions_found
+
+    def _is_valid_ticket_mention(self, ticket_key: str, content: str, title: str) -> bool:
+        """Validate if this is a real ticket mention, not a false positive"""
+        if not content and not title:
+            return False
+        
+        search_text = f"{content} {title}".lower()
+        ticket_lower = ticket_key.lower()
+        
+        # Check for obvious false positives
+        false_positive_indicators = [
+            "address", "street", "blvd", "boulevard", "avenue", "road", "drive",
+            "phone", "telephone", "zip", "postal", "credit card", "account number",
+            "transaction", "order", "invoice", "receipt", "serial number"
+        ]
+        
+        for indicator in false_positive_indicators:
+            if indicator in search_text and ticket_key.replace('PDW-', '') in search_text:
+                return False
+        
+        # Positive indicators - content that suggests real ticket mentions
+        positive_indicators = [
+            ticket_lower,  # Full ticket key
+            f"browse/{ticket_lower}",  # Jira URL
+            f"{ticket_lower}:",  # Ticket title format
+            "jira", "atlassian", "ticket", "issue", "story", "epic",
+            "project", "development", "feature", "bug", "task"
+        ]
+        
+        # Must have at least one positive indicator
+        has_positive = any(indicator in search_text for indicator in positive_indicators)
+        
+        # Additional validation for PDW tickets
+        if ticket_key.startswith('PDW-'):
+            # If only the number was found (not full PDW-XXXX), be more strict
+            ticket_number = ticket_key.replace('PDW-', '')
+            if ticket_number in search_text and ticket_lower not in search_text:
+                # Only accept if it's in a clear project/development context
+                development_context = [
+                    "pdw", "project", "development", "jira", "ticket", "issue", 
+                    "story", "epic", "task", "feature", "improvement"
+                ]
+                return any(ctx in search_text for ctx in development_context)
+        
+        return has_positive
+
+    def find_confluence_mentions_for_tickets(self, tickets: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        """Find Confluence mentions for main ticket and parent ticket only"""
+        ticket_keys_to_search = set()
+        
+        # Collect only main ticket and parent ticket keys
+        for ticket in tickets:
+            # Add main ticket key
+            ticket_keys_to_search.add(ticket['key'])
+            
+            # Add parent ticket key if exists
+            if 'parent_ticket' in ticket:
+                parent_key = ticket['parent_ticket'].get('key')
+                if parent_key:
+                    ticket_keys_to_search.add(parent_key)
+        
+        # Convert to list and search
+        ticket_keys_list = list(ticket_keys_to_search)
+        print(f"🔍 Confluence search limited to main ticket and parent only: {', '.join(ticket_keys_list)}")
+        return self.search_confluence_for_ticket_mentions(ticket_keys_list)
 
 def main():
     # Load environment variables from .env file

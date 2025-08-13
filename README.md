@@ -100,6 +100,7 @@ GENERATE_TEST_CASES=true
 FETCH_PRS=true
 PREVIEW_MODE=false
 FETCH_PARENT_CONTEXT=true
+FETCH_CONFLUENCE=true
 ```
 
 ### 2. API Token Setup
@@ -215,7 +216,15 @@ When enabled with `FETCH_PARENT_CONTEXT=true`, the tool provides comprehensive p
 - **Enhanced Context**: Includes parent context and related child issues for better test case generation
 - **Smart Prioritization**: Focuses testing on the current ticket while using parent/child context for comprehensive understanding
 
-### 6. **Multi-Repository Support**
+### 6. **Confluence Documentation Integration** 📚
+When enabled with `FETCH_CONFLUENCE=true`, the tool automatically discovers and includes broader project documentation:
+- **Explicit Link Fetching**: Extracts and fetches Confluence URLs found in ticket descriptions
+- **Mention Search**: Searches all Confluence spaces for pages mentioning ticket keys (main, parent, and related issues)
+- **Comprehensive Coverage**: Uses Confluence REST API v2 and CQL (Confluence Query Language) for thorough discovery
+- **Project Context**: Includes relevant documentation content in AI test case generation for better understanding
+- **Structured Output**: Saves all Confluence findings to JSON for future reference and analysis
+
+### 7. **Multi-Repository Support**
 For tickets spanning multiple repositories (like microservices), the tool:
 - Finds PRs across all relevant repositories
 - Selects one PR per repository (lowest ID, non-declined)
