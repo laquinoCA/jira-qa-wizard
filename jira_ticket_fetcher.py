@@ -261,7 +261,7 @@ class JiraTicketFetcher:
         ac_field_id = self.find_acceptance_criteria_field()
         
         # Define fields to fetch
-        fields = ["key", "summary", "description", "status", "assignee", "created", "updated"]
+        fields = ["key", "summary", "description", "status", "assignee", "created", "updated", "parent"]
         
         # Add custom description field if specified
         description_field_id = os.getenv('DESCRIPTION_FIELD')
@@ -306,6 +306,15 @@ class JiraTicketFetcher:
                 'created': issue['fields'].get('created', ''),
                 'updated': issue['fields'].get('updated', '')
             }
+            
+            # Fetch parent ticket context if feature flag is enabled
+            fetch_parent = os.getenv('FETCH_PARENT_CONTEXT', 'false').lower() == 'true'
+            if fetch_parent and issue['fields'].get('parent'):
+                parent_key = issue['fields']['parent']['key']
+                print(f"🔗 Fetching parent ticket context for {parent_key}")
+                parent_context = self.fetch_parent_ticket_context(parent_key)
+                if parent_context:
+                    ticket_data['parent_ticket'] = parent_context
             
             # Fetch PR information using GitHub API search
             pr_info = self.fetch_prs_from_github(issue['key'])
@@ -361,6 +370,25 @@ class JiraTicketFetcher:
             else:
                 print(f"\n🔗 Pull Requests: No PRs found")
             
+            # Display parent ticket information if available
+            if 'parent_ticket' in ticket and ticket['parent_ticket']:
+                parent = ticket['parent_ticket']
+                print(f"\n📋 Parent Ticket: {parent['key']} - {parent['summary']}")
+                if parent.get('description'):
+                    parent_desc_preview = parent['description'][:200] + '...' if len(parent['description']) > 200 else parent['description']
+                    print(f"    Description: {parent_desc_preview}")
+                if parent.get('acceptance_criteria'):
+                    parent_ac_preview = parent['acceptance_criteria'][:100] + '...' if len(parent['acceptance_criteria']) > 100 else parent['acceptance_criteria']
+                    print(f"    Acceptance Criteria: {parent_ac_preview}")
+                
+                # Display related issues if available
+                if parent.get('related_issues'):
+                    related_issues = parent['related_issues']
+                    print(f"\n🔗 Child Issues ({len(related_issues)}):")
+                    for issue in related_issues:
+                        print(f"    • {issue['key']} - {issue['summary']}")
+                        print(f"      Status: {issue['status']}")
+            
             print("=" * 60)
             if ticket['acceptance_criteria']:
                 print("✅ Acceptance Criteria:")
@@ -411,7 +439,7 @@ class JiraTicketFetcher:
         
         return '\n'.join(formatted_lines)
     
-    def generate_test_cases(self, ticket_data: Dict[str, Any], pr_context: str = "") -> tuple[str | None, str]:
+    def generate_test_cases(self, ticket_data: Dict[str, Any], pr_context: str = "", parent_context: str = "") -> tuple[str | None, str]:
         """Generate test cases using Claude AI based on ticket data"""
         issue_key = ticket_data.get('key', 'Unknown')
         summary = ticket_data.get('summary', 'No summary')
@@ -434,12 +462,27 @@ ACCEPTANCE CRITERIA:
             context += pr_context
             print(f"📋 Including enhanced context ({len(pr_context)} characters)")
         
+        if parent_context:
+            context += parent_context
+            print(f"📋 Including parent ticket context ({len(parent_context)} characters)")
+        
         # Store the context that will be used for test case generation
         generation_context = context
         
         # Generate test cases using Claude AI with all the context
         prompt = f"""You are a QA expert generating comprehensive test cases for a software development ticket to be executed in our QA environment.
-think" < "think hard" < "think harder" < "ultrathink.
+Be comprehensive and precise. Output only the test cases in the specified format.
+
+IMPORTANT: Generate test cases ONLY for the main ticket described in the TICKET, SUMMARY, DESCRIPTION, and ACCEPTANCE CRITERIA sections. 
+
+The PARENT TICKET CONTEXT and CHILD ISSUES CONTEXT sections are provided for broader project understanding and context awareness, but should NOT be the primary focus of your test cases. Use this context to:
+- Better understand the bigger picture and business goals
+- Ensure test cases align with the overall project direction
+- Include relevant integration points where they relate to the main ticket
+- Avoid conflicts with parallel work streams
+
+PRIMARY TEST FOCUS: Generate test cases specifically for the main ticket's functionality, implementation, and acceptance criteria.
+
 Based on the following context, generate detailed, specific test cases that cover:
 1. Implementation verification based on actual code changes
 2. Acceptance criteria validation  
@@ -589,6 +632,9 @@ Requirements:
 - If testing APIs, include exact endpoints, headers, and payload examples suitable for QA environment
 - Try to build the test cases like a QA engineer would do
 - Try to make them easy to understand for Product Owners
+- If an endpoint, method, or behavior isn’t visible in code/PR/AC, label it Assumption: and keep it minimal.
+- Detect the repo name from PR context (title, branch, or changed file paths) and prefix all links/requests with the mapped QA base URL. If multiple repos are touched, create separate sections per repo.
+- verify coverage (all ACs referenced at least once; each changed function referenced by at least one test).Not to print the self-check, only use it to improve the final.
 
 IMPORTANT: Generate ONLY the test cases without any introductory text or concluding summary. Start directly with the first test case heading and end with the last test case. Do not include phrases like "Based on the provided context" at the beginning or "These test cases cover..." at the end.
 
@@ -814,7 +860,31 @@ Generate comprehensive, QA environment-appropriate test cases now:"""
                     pr_context = ''.join(pr_context_parts)
                     print(f"📋 Including PR context from {len(pr_context_parts)} repository/repositories for test case generation")
             
-            test_cases, generation_context = self.generate_test_cases(ticket, pr_context=pr_context)
+            # Build parent context if available
+            parent_context = ""
+            if ticket.get('parent_ticket'):
+                parent = ticket['parent_ticket']
+                parent_context = f"\n\nPARENT TICKET CONTEXT:\nKey: {parent['key']}\nSummary: {parent['summary']}\nDescription: {parent['description']}"
+                if parent.get('acceptance_criteria'):
+                    parent_context += f"\nAcceptance Criteria: {parent['acceptance_criteria']}"
+                
+                # Add child issues context if available
+                if parent.get('related_issues'):
+                    related_issues = parent['related_issues']
+                    parent_context += f"\n\nCHILD ISSUES CONTEXT (for broader project understanding, not primary test focus):"
+                    for issue in related_issues:
+                        parent_context += f"\n\n{issue['key']} - {issue['summary']}"
+                        parent_context += f"\nStatus: {issue['status']}"
+                        if issue.get('description'):
+                            # Truncate long descriptions
+                            desc = issue['description'][:300] + "..." if len(issue['description']) > 300 else issue['description']
+                            parent_context += f"\nDescription: {desc}"
+                        if issue.get('acceptance_criteria'):
+                            # Truncate long acceptance criteria
+                            ac = issue['acceptance_criteria'][:200] + "..." if len(issue['acceptance_criteria']) > 200 else issue['acceptance_criteria']
+                            parent_context += f"\nAcceptance Criteria: {ac}"
+            
+            test_cases, generation_context = self.generate_test_cases(ticket, pr_context=pr_context, parent_context=parent_context)
             
             if test_cases:
                 print(f"📝 Generated test cases for {ticket['key']}")
@@ -835,6 +905,180 @@ Generate comprehensive, QA environment-appropriate test cases now:"""
                 ticket['test_cases_updated'] = False
         
         return tickets
+    
+    def fetch_parent_ticket_context(self, parent_key: str) -> Dict[str, Any]:
+        """Fetch parent ticket with description and acceptance criteria fields"""
+        if not parent_key:
+            return {}
+        
+        # Get the same custom fields we use for regular tickets
+        description_field_id = os.getenv('DESCRIPTION_FIELD', 'description')
+        ac_field_id = os.getenv('ACCEPTANCE_CRITERIA_FIELD')
+        
+        fields = ["key", "summary", description_field_id]
+        if ac_field_id:
+            fields.append(ac_field_id)
+        
+        url = f"{self.jira_url}/rest/api/3/issue/{parent_key}"
+        headers = {
+            "Authorization": self.auth_header,
+            "Accept": "application/json"
+        }
+        
+        params = {
+            "fields": ",".join(fields)
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                issue_data = response.json()
+                fields_data = issue_data.get('fields', {})
+                
+                # Extract description from custom field or standard field
+                description_content = fields_data.get(description_field_id)
+                description = self._extract_text_content(description_content)
+                
+                # Extract acceptance criteria if available
+                acceptance_criteria = None
+                if ac_field_id and ac_field_id in fields_data:
+                    ac_content = fields_data[ac_field_id]
+                    acceptance_criteria = self._extract_text_content(ac_content)
+                
+                parent_data = {
+                    'key': parent_key,
+                    'summary': fields_data.get('summary', 'No summary'),
+                    'description': description,
+                    'acceptance_criteria': acceptance_criteria
+                }
+                
+                # Fetch linked issues if feature flag is enabled
+                fetch_parent = os.getenv('FETCH_PARENT_CONTEXT', 'false').lower() == 'true'
+                if fetch_parent:
+                    linked_issues = self.fetch_linked_issues(parent_key)
+                    if linked_issues:
+                        parent_data['related_issues'] = linked_issues
+                        print(f"   🔗 Included {len(linked_issues)} related issues")
+                
+                return parent_data
+            else:
+                print(f"⚠️ Error fetching parent ticket {parent_key}: {response.status_code}")
+                return {}
+                
+        except Exception as e:
+            print(f"⚠️ Error fetching parent ticket {parent_key}: {str(e)}")
+            return {}
+    
+    def fetch_linked_issues(self, parent_key: str) -> List[Dict[str, Any]]:
+        """Fetch child issues of the parent ticket using JQL search"""
+        if not parent_key:
+            return []
+        
+        # Use JQL to find all child issues of the parent
+        jql_query = f'parent = {parent_key}'
+        
+        # Get the same custom fields we use for regular tickets
+        description_field_id = os.getenv('DESCRIPTION_FIELD', 'description')
+        ac_field_id = os.getenv('ACCEPTANCE_CRITERIA_FIELD')
+        
+        fields = ["key", "summary", "status", description_field_id]
+        if ac_field_id:
+            fields.append(ac_field_id)
+        
+        try:
+            # Use the existing search_tickets method to find child issues
+            search_results = self.search_tickets(jql_query, fields)
+            
+            if not search_results or 'issues' not in search_results:
+                return []
+            
+            child_issues = search_results['issues']
+            if not child_issues:
+                return []
+            
+            linked_issues = []
+            print(f"🔗 Found {len(child_issues)} child issues for parent {parent_key}")
+            
+            for issue in child_issues:
+                # Extract fields similar to fetch_tickets_with_criteria
+                fields_data = issue.get('fields', {})
+                
+                # Extract description from custom field or standard field  
+                description_content = fields_data.get(description_field_id)
+                description = self._extract_text_content(description_content)
+                
+                # Extract acceptance criteria if available
+                acceptance_criteria = None
+                if ac_field_id and ac_field_id in fields_data:
+                    ac_content = fields_data[ac_field_id]
+                    acceptance_criteria = self._extract_text_content(ac_content)
+                
+                issue_data = {
+                    'key': issue['key'],
+                    'summary': fields_data.get('summary', 'No summary'),
+                    'status': fields_data.get('status', {}).get('name', 'Unknown'),
+                    'description': description,
+                    'acceptance_criteria': acceptance_criteria,
+                    'relationship': 'child of'  # All are child issues
+                }
+                
+                linked_issues.append(issue_data)
+                print(f"   ✅ Fetched {issue['key']} (child issue)")
+            
+            return linked_issues
+            
+        except Exception as e:
+            print(f"⚠️ Error fetching child issues for {parent_key}: {str(e)}")
+            return []
+    
+    def _fetch_issue_details(self, issue_key: str, fields: List[str]) -> Dict[str, Any]:
+        """Fetch detailed information for a specific issue"""
+        url = f"{self.jira_url}/rest/api/3/issue/{issue_key}"
+        headers = {
+            "Authorization": self.auth_header,
+            "Accept": "application/json"
+        }
+        
+        params = {
+            "fields": ",".join(fields)
+        }
+        
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                issue_data = response.json()
+                fields_data = issue_data.get('fields', {})
+                
+                # Get custom fields
+                description_field_id = os.getenv('DESCRIPTION_FIELD', 'description')
+                ac_field_id = os.getenv('ACCEPTANCE_CRITERIA_FIELD')
+                
+                # Extract description from custom field or standard field
+                description_content = fields_data.get(description_field_id)
+                description = self._extract_text_content(description_content)
+                
+                # Extract acceptance criteria if available
+                acceptance_criteria = None
+                if ac_field_id and ac_field_id in fields_data:
+                    ac_content = fields_data[ac_field_id]
+                    acceptance_criteria = self._extract_text_content(ac_content)
+                
+                return {
+                    'key': issue_key,
+                    'summary': fields_data.get('summary', 'No summary'),
+                    'status': fields_data.get('status', {}).get('name', 'Unknown'),
+                    'description': description,
+                    'acceptance_criteria': acceptance_criteria
+                }
+            else:
+                print(f"   ⚠️ Error fetching {issue_key}: {response.status_code}")
+                return {}
+                
+        except Exception as e:
+            print(f"   ⚠️ Error fetching {issue_key}: {str(e)}")
+            return {}
     
     def get_issue_links(self, issue_key: str) -> List[Dict[str, Any]]:
         """Get all links for a Jira issue including PR links"""

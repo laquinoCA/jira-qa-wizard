@@ -99,6 +99,7 @@ TEST_CASES_FIELD=customfield_11600
 GENERATE_TEST_CASES=true
 FETCH_PRS=true
 PREVIEW_MODE=false
+FETCH_PARENT_CONTEXT=true
 ```
 
 ### 2. API Token Setup
@@ -207,7 +208,14 @@ The AI receives comprehensive context for generating test cases:
 - **Change Statistics**: Lines added, removed, total changes
 - **File-specific Details**: Per-file change breakdowns
 
-### 5. **Multi-Repository Support**
+### 5. **Parent/Child Ticket Context** 🔄
+When enabled with `FETCH_PARENT_CONTEXT=true`, the tool provides comprehensive parent-child relationship analysis:
+- **Parent Ticket Details**: Fetches parent ticket description and acceptance criteria using custom fields
+- **Child Issues Discovery**: Dynamically finds all child issues using JQL query `parent = {parent_key}`
+- **Enhanced Context**: Includes parent context and related child issues for better test case generation
+- **Smart Prioritization**: Focuses testing on the current ticket while using parent/child context for comprehensive understanding
+
+### 6. **Multi-Repository Support**
 For tickets spanning multiple repositories (like microservices), the tool:
 - Finds PRs across all relevant repositories
 - Selects one PR per repository (lowest ID, non-declined)
