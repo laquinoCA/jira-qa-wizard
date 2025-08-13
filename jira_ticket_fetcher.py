@@ -471,6 +471,17 @@ ACCEPTANCE CRITERIA:
             context += confluence_context
             print(f"📋 Including project documentation context ({len(confluence_context)} characters)")
         
+        # Add comments and attachments context if available
+        comments_context = self._build_comments_context(ticket_data)
+        if comments_context:
+            context += comments_context
+            print(f"📋 Including comments context ({len(comments_context)} characters)")
+        
+        attachments_context = self._build_attachments_context(ticket_data)
+        if attachments_context:
+            context += attachments_context
+            print(f"📋 Including attachments context ({len(attachments_context)} characters)")
+        
         # Store the context that will be used for test case generation
         generation_context = context
         
@@ -824,6 +835,29 @@ Generate comprehensive, QA environment-appropriate test cases now:"""
             confluence_mentions = self.find_confluence_mentions_for_tickets(tickets)
         else:
             print("ℹ️  Confluence fetching disabled (FETCH_CONFLUENCE=false)")
+        
+        # Fetch Jira comments and attachments for main tickets
+        fetch_comments = os.getenv('FETCH_COMMENTS_JIRA', 'false').lower() == 'true'
+        fetch_attachments = os.getenv('FETCH_ATTACHMENTS_JIRA', 'false').lower() == 'true'
+        
+        if fetch_comments or fetch_attachments:
+            print(f"🔗 Fetching additional Jira data...")
+            for ticket in tickets:
+                ticket_key = ticket['key']
+                
+                if fetch_comments:
+                    print(f"💬 Fetching comments for {ticket_key}...")
+                    ticket['comments'] = self.fetch_jira_comments(ticket_key)
+                else:
+                    print("ℹ️  Jira comments fetching disabled (FETCH_COMMENTS_JIRA=false)")
+                
+                if fetch_attachments:
+                    print(f"📎 Fetching attachments for {ticket_key}...")
+                    ticket['attachments'] = self.fetch_jira_attachments(ticket_key)
+                else:
+                    print("ℹ️  Jira attachments fetching disabled (FETCH_ATTACHMENTS_JIRA=false)")
+        else:
+            print("ℹ️  Jira comments and attachments fetching disabled")
         
         test_cases_field_id = os.getenv('TEST_CASES_FIELD', 'customfield_11600')
         
@@ -1962,6 +1996,191 @@ DETAILED FILE CHANGES:
         ticket_keys_list = list(ticket_keys_to_search)
         print(f"🔍 Confluence search limited to main ticket and parent only: {', '.join(ticket_keys_list)}")
         return self.search_confluence_for_ticket_mentions(ticket_keys_list)
+
+    def fetch_jira_comments(self, issue_key: str) -> List[Dict[str, Any]]:
+        """Fetch comments for a Jira issue"""
+        try:
+            url = f"{self.jira_url}/rest/api/3/issue/{issue_key}/comment"
+            headers = {
+                "Authorization": self.auth_header,
+                "Accept": "application/json"
+            }
+            
+            params = {
+                "maxResults": 50,  # Limit to 50 most recent comments
+                "orderBy": "created",  # Order by creation date
+                "expand": "renderedBody"  # Get rendered HTML content
+            }
+            
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                comments_data = response.json()
+                comments = []
+                
+                for comment in comments_data.get("comments", []):
+                    comment_info = {
+                        "id": comment.get("id"),
+                        "author": comment.get("author", {}).get("displayName", "Unknown"),
+                        "author_email": comment.get("author", {}).get("emailAddress", ""),
+                        "created": comment.get("created", ""),
+                        "updated": comment.get("updated", ""),
+                        "body": comment.get("body", {}),
+                        "rendered_body": comment.get("renderedBody", "")
+                    }
+                    
+                    # Extract plain text from comment body
+                    if comment_info["body"]:
+                        comment_info["body_text"] = self._extract_adf_text(comment_info["body"])
+                    else:
+                        comment_info["body_text"] = ""
+                    
+                    comments.append(comment_info)
+                
+                print(f"   ✅ Found {len(comments)} comment(s) for {issue_key}")
+                return comments
+            else:
+                print(f"   ❌ Failed to fetch comments for {issue_key}: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            print(f"   ❌ Error fetching comments for {issue_key}: {str(e)}")
+            return []
+
+    def fetch_jira_attachments(self, issue_key: str) -> List[Dict[str, Any]]:
+        """Fetch attachments for a Jira issue"""
+        try:
+            url = f"{self.jira_url}/rest/api/3/issue/{issue_key}"
+            headers = {
+                "Authorization": self.auth_header,
+                "Accept": "application/json"
+            }
+            
+            params = {
+                "fields": "attachment"
+            }
+            
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                issue_data = response.json()
+                attachments_data = issue_data.get("fields", {}).get("attachment", [])
+                attachments = []
+                
+                for attachment in attachments_data:
+                    attachment_info = {
+                        "id": attachment.get("id"),
+                        "filename": attachment.get("filename", ""),
+                        "author": attachment.get("author", {}).get("displayName", "Unknown"),
+                        "created": attachment.get("created", ""),
+                        "size": attachment.get("size", 0),
+                        "mime_type": attachment.get("mimeType", ""),
+                        "content_url": attachment.get("content", ""),
+                        "thumbnail_url": attachment.get("thumbnail", "")
+                    }
+                    
+                    # Format file size for readability
+                    size_bytes = attachment_info["size"]
+                    if size_bytes < 1024:
+                        attachment_info["size_formatted"] = f"{size_bytes} bytes"
+                    elif size_bytes < 1024 * 1024:
+                        attachment_info["size_formatted"] = f"{size_bytes / 1024:.1f} KB"
+                    else:
+                        attachment_info["size_formatted"] = f"{size_bytes / (1024 * 1024):.1f} MB"
+                    
+                    attachments.append(attachment_info)
+                
+                print(f"   ✅ Found {len(attachments)} attachment(s) for {issue_key}")
+                return attachments
+            else:
+                print(f"   ❌ Failed to fetch attachments for {issue_key}: {response.status_code}")
+                return []
+                
+        except Exception as e:
+            print(f"   ❌ Error fetching attachments for {issue_key}: {str(e)}")
+            return []
+
+    def _extract_adf_text(self, adf_content: Dict[str, Any]) -> str:
+        """Extract plain text from Atlassian Document Format (ADF) content"""
+        try:
+            if not adf_content:
+                return ""
+            
+            def extract_text_recursive(node):
+                text_parts = []
+                
+                if isinstance(node, dict):
+                    # Handle text nodes
+                    if node.get("type") == "text":
+                        text_parts.append(node.get("text", ""))
+                    
+                    # Process content array
+                    if "content" in node:
+                        for child in node["content"]:
+                            text_parts.append(extract_text_recursive(child))
+                    
+                    # Add newlines for paragraph breaks
+                    if node.get("type") == "paragraph":
+                        text_parts.append("\n")
+                
+                elif isinstance(node, list):
+                    for item in node:
+                        text_parts.append(extract_text_recursive(item))
+                
+                return "".join(text_parts)
+            
+            return extract_text_recursive(adf_content).strip()
+            
+        except Exception as e:
+            print(f"   ⚠️ Error extracting ADF text: {str(e)}")
+            return str(adf_content)[:500] + "..." if len(str(adf_content)) > 500 else str(adf_content)
+
+    def _build_comments_context(self, ticket: Dict[str, Any]) -> str:
+        """Build context string from ticket comments"""
+        comments = ticket.get('comments', [])
+        if not comments:
+            return ""
+        
+        context_parts = ["\n\nJIRA COMMENTS:"]
+        context_parts.append("=" * 50)
+        
+        # Limit to most recent 10 comments to avoid overwhelming context
+        recent_comments = comments[-10:] if len(comments) > 10 else comments
+        
+        for i, comment in enumerate(recent_comments, 1):
+            context_parts.append(f"\nComment #{i}:")
+            context_parts.append(f"Author: {comment.get('author', 'Unknown')}")
+            context_parts.append(f"Created: {comment.get('created', '')}")
+            
+            body_text = comment.get('body_text', '').strip()
+            if body_text:
+                # Truncate very long comments
+                if len(body_text) > 1000:
+                    body_text = body_text[:1000] + "... [truncated]"
+                context_parts.append(f"Content: {body_text}")
+            context_parts.append("-" * 30)
+        
+        return "\n".join(context_parts)
+
+    def _build_attachments_context(self, ticket: Dict[str, Any]) -> str:
+        """Build context string from ticket attachments"""
+        attachments = ticket.get('attachments', [])
+        if not attachments:
+            return ""
+        
+        context_parts = ["\n\nJIRA ATTACHMENTS:"]
+        context_parts.append("=" * 50)
+        
+        for i, attachment in enumerate(attachments, 1):
+            context_parts.append(f"\nAttachment #{i}:")
+            context_parts.append(f"Filename: {attachment.get('filename', 'Unknown')}")
+            context_parts.append(f"Size: {attachment.get('size_formatted', 'Unknown')}")
+            context_parts.append(f"Type: {attachment.get('mime_type', 'Unknown')}")
+            context_parts.append(f"Author: {attachment.get('author', 'Unknown')}")
+            context_parts.append(f"Created: {attachment.get('created', '')}")
+            context_parts.append("-" * 30)
+        
+        return "\n".join(context_parts)
 
 def main():
     # Load environment variables from .env file
