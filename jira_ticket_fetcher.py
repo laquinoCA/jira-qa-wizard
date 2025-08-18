@@ -37,7 +37,7 @@ class JiraTicketFetcher:
         if fields is None:
             fields = ["summary", "description", "key", "status", "assignee"]
         
-        url = f"{self.jira_url}/rest/api/3/search"
+        url = f"{self.jira_url}/rest/api/3/search/jql"
         headers = {
             "Authorization": self.auth_header,
             "Accept": "application/json",
@@ -60,16 +60,25 @@ class JiraTicketFetcher:
     
     def get_field_info(self) -> Dict[str, Any]:
         """Get all available fields to find custom field IDs"""
-        url = f"{self.jira_url}/rest/api/3/field"
+        url = f"{self.jira_url}/rest/api/3/field/search"
         headers = {
             "Authorization": self.auth_header,
-            "Accept": "application/json"
+            "Accept": "application/json",
+            "Content-Type": "application/json"
         }
         
-        response = requests.get(url, headers=headers)
+        # The new field search API requires a POST request with query parameters
+        payload = {
+            "maxResults": 1000,
+            "startAt": 0
+        }
+        
+        response = requests.post(url, headers=headers, json=payload)
         
         if response.status_code == 200:
-            return response.json()
+            result = response.json()
+            # The new API returns data in a 'values' array
+            return result.get('values', [])
         else:
             print(f"Error fetching fields: {response.status_code} - {response.text}")
             return []
@@ -82,7 +91,8 @@ class JiraTicketFetcher:
             print(f"Using specified Acceptance Criteria field: {ac_field_id}")
             return ac_field_id
         
-        fields = self.get_field_info()
+        print("No Acceptance Criteria field specified in environment variables.")
+        return None
         
         # Common names for acceptance criteria fields
         ac_field_names = [
@@ -273,10 +283,8 @@ class JiraTicketFetcher:
         if ac_field_id and ac_field_id not in fields:
             fields.append(ac_field_id)
         
-        # Add all custom fields to see what's available (for debugging)
-        all_fields = self.get_field_info()
-        custom_fields = [f['id'] for f in all_fields if f['id'].startswith('customfield_')]
-        fields.extend(custom_fields[:10])  # Add first 10 custom fields for inspection
+        # Skip fetching all fields since the API endpoint is deprecated
+        # Custom fields are already specified via environment variables
         
         # Search for tickets
         results = self.search_tickets(jql, fields)
